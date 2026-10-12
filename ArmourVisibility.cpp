@@ -504,10 +504,6 @@ struct SlotTick
 	AttachSlot slot;
 };
 
-// Ticks belonging to each open inventory window. An entry is replaced whenever
-// that window's sections are set up again, so pointers never outlive a rebuild.
-static boost::unordered_map<InventoryGUI*, std::vector<SlotTick> > g_ticks;
-
 static std::string PointerString(const void* p)
 {
 	std::ostringstream out;
@@ -569,8 +565,6 @@ static void SetupSections_hook(CharacterInventoryLayout* self, InventoryGUI* gui
 		return;
 
 	hand owner = inventory->getOwner()->getHandle();
-	std::vector<SlotTick>& ticks = g_ticks[gui];
-	ticks.clear();
 
 	for (SectionGUIMap::iterator it = sections.begin(); it != sections.end(); ++it)
 	{
@@ -610,23 +604,10 @@ static void SetupSections_hook(CharacterInventoryLayout* self, InventoryGUI* gui
 		tick.sectionWidget = sectionWidget;
 		tick.owner = owner;
 		tick.slot = slot;
-		ticks.push_back(tick);
+		// The widget pointers are only valid while this section layout is live.
+		// Never retain them across GUI updates or a vendor window rebuild.
 		SyncTick(tick);
 	}
-}
-
-// Keeps ticks in step with the saved state (e.g. after loading) and hides them
-// if the character leaves the squad.
-static void (*InventoryGUIUpdate_orig)(InventoryGUI*) = NULL;
-static void InventoryGUIUpdate_hook(InventoryGUI* self)
-{
-	InventoryGUIUpdate_orig(self);
-
-	boost::unordered_map<InventoryGUI*, std::vector<SlotTick> >::iterator it = g_ticks.find(self);
-	if (it == g_ticks.end())
-		return;
-	for (size_t i = 0; i < it->second.size(); ++i)
-		SyncTick(it->second[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -661,8 +642,6 @@ __declspec(dllexport) void startPlugin()
 
 	InstallHook(KenshiLib::GetRealAddress((void*)&CharacterInventoryLayout_setupSections_PLACEHOLDER),
 		(void*)&SetupSections_hook, &SetupSections_orig, "CharacterInventoryLayout::setupSections");
-	InstallHook(KenshiLib::GetRealAddress(&InventoryGUI::_NV_update),
-		(void*)&InventoryGUIUpdate_hook, &InventoryGUIUpdate_orig, "InventoryGUI::update");
 
 	DebugLog("ArmourVisibility: loaded");
 }
