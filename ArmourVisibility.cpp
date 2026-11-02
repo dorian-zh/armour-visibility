@@ -207,6 +207,13 @@ static void RecordAttach(Item* item, bool hasMesh, const std::string& mesh, cons
 	g_attachRecords[item] = record;
 }
 
+// Attach data is only needed for your own squad, so NPCs are skipped to keep
+// the record table small.
+static bool IsSquadAppearance(AppearanceBase* appearance)
+{
+	return appearance && appearance->me && appearance->me->isPlayerCharacter();
+}
+
 static bool ShouldBlockAttach(AppearanceBase* appearance, Item* item)
 {
 	if (!appearance || !item || !appearance->me)
@@ -218,7 +225,8 @@ static bool AttachItem2_hook(AppearanceBase* self, Item* item, const std::string
 {
 	if (t_attachDepth == 0)
 	{
-		RecordAttach(item, false, std::string(), slot);
+		if (IsSquadAppearance(self))
+			RecordAttach(item, false, std::string(), slot);
 		if (ShouldBlockAttach(self, item))
 			return BLOCKED_ATTACH_RETURN;
 	}
@@ -232,7 +240,8 @@ static bool AttachItem3_hook(AppearanceBase* self, Item* item, const std::string
 {
 	if (t_attachDepth == 0)
 	{
-		RecordAttach(item, true, mesh, slot);
+		if (IsSquadAppearance(self))
+			RecordAttach(item, true, mesh, slot);
 		if (ShouldBlockAttach(self, item))
 			return BLOCKED_ATTACH_RETURN;
 	}
@@ -486,9 +495,15 @@ static void NewGame_hook(SaveManager* self, const std::string& startId)
 }
 
 // ---------------------------------------------------------------------------
-// UI: a tick box on each equipment slot of a character's inventory window.
+// UI: a tick box on each equipment slot of a squad member's inventory window.
 // Ticked = armour in that slot is shown, unticked = hidden.
 // Everything here runs on the UI thread.
+//
+// The plugin deliberately keeps NO pointers to inventory windows or their
+// widgets. Kenshi destroys an inventory window when it closes and often builds
+// the next one at the same memory address, so any stored pointer can end up
+// pointing at freed memory. Each tick carries everything it needs (owner and
+// slot) in its own user strings, and MyGUI destroys it along with the window.
 // ---------------------------------------------------------------------------
 
 // Tick skin used by RE_Kenshi's own settings menu.
@@ -496,41 +511,10 @@ static const char* TICK_SKIN = "Kenshi_TickBoxSkin";
 static const int TICK_SIZE = 18;   // pixels
 static const int TICK_MARGIN = 2;  // pixels from the slot's top-right corner
 
-struct SlotTick
-{
-	MyGUI::Button* button;
-	MyGUI::Widget* sectionWidget;
-	hand owner;
-	AttachSlot slot;
-};
-
-// Ticks belonging to each open inventory window. An entry is replaced whenever
-// that window's sections are set up again, so pointers never outlive a rebuild.
-static boost::unordered_map<InventoryGUI*, std::vector<SlotTick> > g_ticks;
-
-static std::string PointerString(const void* p)
-{
-	std::ostringstream out;
-	out << p;
-	return out.str();
-}
-
-static void PlaceTick(MyGUI::Button* button, MyGUI::Widget* sectionWidget)
-{
-	const MyGUI::IntCoord& c = sectionWidget->getCoord();
-	button->setCoord(c.left + c.width - TICK_SIZE - TICK_MARGIN, c.top + TICK_MARGIN, TICK_SIZE, TICK_SIZE);
-}
-
-static void SyncTick(const SlotTick& tick)
-{
-	Character* character = tick.owner.getCharacter();
-	bool show = character != NULL && character->isPlayerCharacter();
-	tick.button->setVisible(show);
-	if (!show)
-		return;
-	tick.button->setStateSelected(!IsHidden(character, tick.slot));
-	PlaceTick(tick.button, tick.sectionWidget);
-}
+static const char* KEY_TICK = "avTick";
+static const char* KEY_OWNER = "avOwner";
+static const char* KEY_SLOT = "avSlot";
+static const char* KEY_SECTION = "avSection";
 
 static void OnTickClick(MyGUI::WidgetPtr sender)
 {
@@ -539,15 +523,32 @@ static void OnTickClick(MyGUI::WidgetPtr sender)
 		return;
 
 	hand owner;
-	owner.fromString(button->getUserString("avOwner"));
+	owner.fromString(button->getUserString(KEY_OWNER));
 	Character* character = owner.getCharacter();
 	if (!character || !character->isPlayerCharacter())
 		return;
 
-	AttachSlot slot = (AttachSlot)std::atoi(button->getUserString("avSlot").c_str());
+	AttachSlot slot = (AttachSlot)std::atoi(button->getUserString(KEY_SLOT).c_str());
+	if (!IsManagedSlot(slot))
+		return;
+
 	bool shown = !button->getStateSelected();
 	button->setStateSelected(shown);
 	SetSlotHidden(character, slot, !shown);
+}
+
+// Finds a tick this plugin already added for a section, if setupSections runs
+// more than once for the same window.
+static MyGUI::Button* FindExistingTick(MyGUI::Widget* parent, const std::string& sectionName)
+{
+	size_t count = parent->getChildCount();
+	for (size_t i = 0; i < count; ++i)
+	{
+		MyGUI::Widget* child = parent->getChildAt(i);
+		if (child && child->isUserString(KEY_TICK) && child->getUserString(KEY_SECTION) == sectionName)
+			return child->castType<MyGUI::Button>(false);
+	}
+	return NULL;
 }
 
 typedef std::map<std::string, InventorySectionGUI*, std::less<std::string>,
@@ -565,12 +566,18 @@ static void SetupSections_hook(CharacterInventoryLayout* self, InventoryGUI* gui
 {
 	SetupSections_orig(self, gui, sections, inventory);
 
-	if (!gui || !inventory || !inventory->getOwner())
+	if (!inventory)
+		return;
+	RootObject* ownerObject = inventory->getOwner();
+	if (!ownerObject)
 		return;
 
-	hand owner = inventory->getOwner()->getHandle();
-	std::vector<SlotTick>& ticks = g_ticks[gui];
-	ticks.clear();
+	// Only your own squad members get ticks (not loot bodies, traders, etc.).
+	hand owner = ownerObject->getHandle();
+	Character* character = owner.getCharacter();
+	if (!character || !character->isPlayerCharacter())
+		return;
+	std::string ownerString = owner.toString();
 
 	for (SectionGUIMap::iterator it = sections.begin(); it != sections.end(); ++it)
 	{
@@ -587,46 +594,25 @@ static void SetupSections_hook(CharacterInventoryLayout* self, InventoryGUI* gui
 		if (!parent)
 			continue;
 
-		// Reuse the tick if this window's sections are set up more than once.
-		std::string name = "ArmourVisibilityTick_" + PointerString(gui) + "_" + it->first;
-		MyGUI::Button* button = NULL;
-		MyGUI::Widget* existing = parent->findWidget(name);
-		if (existing)
-			button = existing->castType<MyGUI::Button>(false);
+		MyGUI::Button* button = FindExistingTick(parent, it->first);
 		if (!button)
 		{
 			button = parent->createWidget<MyGUI::Button>(TICK_SKIN, 0, 0, TICK_SIZE, TICK_SIZE,
-				MyGUI::Align::Default, name);
+				MyGUI::Align::Default);
+			button->setUserString(KEY_TICK, "1");
+			button->setUserString(KEY_SECTION, it->first);
 			button->eventMouseButtonClick += MyGUI::newDelegate(OnTickClick);
 		}
 
 		std::ostringstream slotText;
 		slotText << (int)slot;
-		button->setUserString("avOwner", owner.toString());
-		button->setUserString("avSlot", slotText.str());
+		button->setUserString(KEY_OWNER, ownerString);
+		button->setUserString(KEY_SLOT, slotText.str());
 
-		SlotTick tick;
-		tick.button = button;
-		tick.sectionWidget = sectionWidget;
-		tick.owner = owner;
-		tick.slot = slot;
-		ticks.push_back(tick);
-		SyncTick(tick);
+		const MyGUI::IntCoord& c = sectionWidget->getCoord();
+		button->setCoord(c.left + c.width - TICK_SIZE - TICK_MARGIN, c.top + TICK_MARGIN, TICK_SIZE, TICK_SIZE);
+		button->setStateSelected(!IsHidden(character, slot));
 	}
-}
-
-// Keeps ticks in step with the saved state (e.g. after loading) and hides them
-// if the character leaves the squad.
-static void (*InventoryGUIUpdate_orig)(InventoryGUI*) = NULL;
-static void InventoryGUIUpdate_hook(InventoryGUI* self)
-{
-	InventoryGUIUpdate_orig(self);
-
-	boost::unordered_map<InventoryGUI*, std::vector<SlotTick> >::iterator it = g_ticks.find(self);
-	if (it == g_ticks.end())
-		return;
-	for (size_t i = 0; i < it->second.size(); ++i)
-		SyncTick(it->second[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -661,8 +647,6 @@ __declspec(dllexport) void startPlugin()
 
 	InstallHook(KenshiLib::GetRealAddress((void*)&CharacterInventoryLayout_setupSections_PLACEHOLDER),
 		(void*)&SetupSections_hook, &SetupSections_orig, "CharacterInventoryLayout::setupSections");
-	InstallHook(KenshiLib::GetRealAddress(&InventoryGUI::_NV_update),
-		(void*)&InventoryGUIUpdate_hook, &InventoryGUIUpdate_orig, "InventoryGUI::update");
 
 	DebugLog("ArmourVisibility: loaded");
 }
